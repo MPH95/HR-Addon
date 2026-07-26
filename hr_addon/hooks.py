@@ -43,6 +43,10 @@ doc_events = {
 		],
 		"on_submit": "hr_addon.events.leave_application.reduce_overtime_on_leave_submit",
 	},
+	"Employee Checkin": {
+		"on_update": "hr_addon.events.employee_checkin.enqueue_workday_sync",
+		"on_trash": "hr_addon.events.employee_checkin.enqueue_workday_sync",
+	},
 	"Attendance": {
 		"on_submit": "hr_addon.events.attendance.create_overtime_ledger_entry_on_attendance_submit",
 		"on_cancel": [

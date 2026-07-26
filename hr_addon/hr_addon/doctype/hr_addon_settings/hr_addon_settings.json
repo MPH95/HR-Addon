@@ -18,6 +18,7 @@
   "enabled",
   "skip_workday_if_no_weekly_hours",
   "allow_workdays_on_holidays",
+  "update_workday_on_employee_checkin",
   "column_break_jozi",
   "workday_break_calculation_mechanism",
   "swap_hours_worked_and_actual_working_hours",
@@ -195,6 +196,13 @@
    "label": "Allow Workdays on Holidays"
   },
   {
+   "default": "0",
+   "description": "When enabled, saving or deleting an Employee Checkin refreshes the Workday of that date in the background, creating it if needed. Keeps the current day up to date instead of waiting for the scheduled job. Manual corrections on a Workday are overwritten as soon as a checkin of that date changes.",
+   "fieldname": "update_workday_on_employee_checkin",
+   "fieldtype": "Check",
+   "label": "Update Workday on Employee Checkin"
+  },
+  {
    "description": "Used to auto-fill Weekly Working Hours > Hours > Break Minutes when the value is 0. If users edit Break Minutes manually, it cannot be saved below the matching minimum rule.",
    "fieldname": "minimum_break_rule",
    "fieldtype": "Table",
@@ -253,7 +261,7 @@
  "index_web_pages_for_search": 1,
  "issingle": 1,
  "links": [],
- "modified": "2026-06-03 17:49:33.500324",
+ "modified": "2026-07-26 09:20:00.000000",
  "modified_by": "Administrator",
  "module": "HR Addon",
  "name": "HR Addon Settings",
