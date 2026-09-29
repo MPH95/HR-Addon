@@ -14,10 +14,7 @@ import frappe
 from frappe import _
 from frappe.utils import add_days, cint, flt, get_datetime, getdate, now_datetime
 
-from hr_addon.hr_addon.doctype.workday.workday import (
-	get_employee_default_work_hour,
-	has_weekly_working_hours_for_date,
-)
+from hr_addon.hr_addon.doctype.workday.workday import get_employee_default_work_hour
 
 ATTENTION_STATUSES = {"Missing Checkin", "Absent", "Missing"}
 # A second punch this close to the previous one is a double tap, not a new stretch of work.
@@ -139,28 +136,166 @@ def _missing_day_count(employee, start, today):
 	return sum(1 for day in _days_for_range(employee, start, today) if day["needs_attention"])
 
 
+def describe_empty_day(current, today, is_workday, is_holiday, leave_docstatus=None):
+	"""Status for a date that has no Workday document yet.
+
+	A past weekday with weekly hours, no holiday and no leave is Missing:
+	the employee should have a check-in or a leave application.
+	"""
+	current = getdate(current)
+	today = getdate(today)
+	if not is_workday:
+		return "Off", False
+	if is_holiday:
+		return "Holiday", False
+	if leave_docstatus == 1:
+		return "On Leave", False
+	if leave_docstatus == 0:
+		return "Pending Leave", False
+	if current < today:
+		return "Missing", True
+	return "Open", False
+
+
+def _looks_like_illness(leave_type):
+	text = (leave_type or "").lower()
+	return any(word in text for word in ("sick", "illness", "krank", "maladie", "medical"))
+
+
+def _leave_rows(employee, start, end):
+	return frappe.get_all(
+		"Leave Application",
+		filters={
+			"employee": employee,
+			"docstatus": ["<", 2],
+			"status": ["not in", ["Rejected", "Cancelled"]],
+			"from_date": ["<=", end],
+			"to_date": [">=", start],
+		},
+		fields=[
+			"name",
+			"leave_type",
+			"from_date",
+			"to_date",
+			"status",
+			"docstatus",
+			"half_day",
+			"half_day_date",
+		],
+		ignore_permissions=True,
+		limit_page_length=200,
+	)
+
+
+def _leave_on(rows, log_date):
+	log_date = getdate(log_date)
+	for row in rows:
+		if getdate(row.from_date) <= log_date <= getdate(row.to_date):
+			return row
+	return None
+
+
+def _leave_payload(row):
+	if not row:
+		return None
+	return {
+		"name": row.name,
+		"leave_type": row.leave_type,
+		"status": row.status,
+		"docstatus": row.docstatus,
+		"illness": _looks_like_illness(row.leave_type),
+	}
+
+
+def _home_office_rows(employee, start, end):
+	"""Work From Home attendance requests. docstatus 0 is waiting for approval.
+
+	The request is the source of truth: HR Addon resets the Attendance status to
+	Present whenever the Workday is rebuilt.
+	"""
+	return frappe.get_all(
+		"Attendance Request",
+		filters={
+			"employee": employee,
+			"reason": "Work From Home",
+			"docstatus": ["<", 2],
+			"from_date": ["<=", end],
+			"to_date": [">=", start],
+		},
+		fields=["name", "from_date", "to_date", "docstatus", "half_day", "half_day_date"],
+		ignore_permissions=True,
+		limit_page_length=200,
+	)
+
+
+def _home_office_payload(row, log_date):
+	if not row:
+		return None
+	half_day = bool(row.half_day and row.half_day_date and getdate(row.half_day_date) == getdate(log_date))
+	return {"name": row.name, "docstatus": row.docstatus, "half_day": half_day}
+
+
+def _blank_day(current, status="Off"):
+	return {
+		"date": str(current),
+		"workday": None,
+		"status": status,
+		"target_hours": 0,
+		"actual_working_hours": 0,
+		"hours_worked": 0,
+		"first_checkin": "",
+		"last_checkout": "",
+		"needs_attention": False,
+		"leave": None,
+		"home_office": None,
+		"schedule": "none",
+	}
+
+
+def schedule_kind(default):
+	"""How Weekly Working Hours treat a weekday.
+
+	work: a row with hours, so the day is expected.
+	free: a row with 0 hours (usually Saturday and Sunday). Punches still become
+	a Workday with 0 target, so they count as overtime.
+	none: no row. HR Addon creates no Workday, so punches are not counted.
+	"""
+	if not default:
+		return "none"
+	return "work" if flt(default.hours) > 0 else "free"
+
+
 def _days_for_range(employee, start, end):
 	today = getdate()
 	joining_date, relieving_date = frappe.get_cached_value(
 		"Employee", employee, ["date_of_joining", "relieving_date"]
 	)
 	workdays = {getdate(row.log_date): row for row in _workday_rows(employee, start, end)}
+	leaves = _leave_rows(employee, start, end)
+	home_office = _home_office_rows(employee, start, end)
 	days = []
 	current = getdate(start)
 	last = getdate(end)
 
 	while current <= last:
-		if joining_date and current < getdate(joining_date):
-			current = add_days(current, 1)
-			continue
-		if relieving_date and current > getdate(relieving_date):
-			break
-		if not has_weekly_working_hours_for_date(employee, current):
+		outside_employment = (joining_date and current < getdate(joining_date)) or (
+			relieving_date and current > getdate(relieving_date)
+		)
+		if outside_employment:
+			days.append(_blank_day(current))
 			current = add_days(current, 1)
 			continue
 
-		row = workdays.get(current)
+		default = get_employee_default_work_hour(employee, current, skip_workday_if_no_weekly_hours=1)
 		holiday = _is_holiday(employee, current)
+		leave = _leave_on(leaves, current)
+		row = workdays.get(current)
+		schedule = schedule_kind(default)
+		expected = schedule == "work"
+		target = flt(default.hours, 2) if default else 0
+		if holiday and default and default.set_target_hours_to_zero_when_date_is_holiday:
+			target = 0
+
 		if row:
 			status = row.status or ""
 			item = {
@@ -173,22 +308,39 @@ def _days_for_range(employee, start, end):
 				"first_checkin": str(row.first_checkin or ""),
 				"last_checkout": str(row.last_checkout or ""),
 			}
+			item["needs_attention"] = current < today and status in ATTENTION_STATUSES
+			if holiday and status in ("Holiday", "Not Workday"):
+				item["needs_attention"] = False
+			# A leave application resolves a day that never got a punch, even
+			# when the Workday document was never rebuilt.
+			if leave and not item["first_checkin"] and status in ("Missing", "Absent", ""):
+				item["status"], item["needs_attention"] = describe_empty_day(
+					current, today, expected, holiday, leave.docstatus
+				)
 		else:
-			status = "Holiday" if holiday else ("Missing" if current < today else "Open")
+			status, needs_attention = describe_empty_day(
+				current, today, expected, holiday, leave.docstatus if leave else None
+			)
 			item = {
 				"date": str(current),
 				"workday": None,
 				"status": status,
-				"target_hours": 0,
+				"target_hours": 0 if status in ("Off", "Holiday") else target,
 				"actual_working_hours": 0,
 				"hours_worked": 0,
 				"first_checkin": "",
 				"last_checkout": "",
+				"needs_attention": needs_attention,
 			}
 
-		item["needs_attention"] = current < today and item["status"] in ATTENTION_STATUSES
-		if holiday and item["status"] in ("Holiday", "Not Workday"):
-			item["needs_attention"] = False
+		item["schedule"] = schedule
+		item["leave"] = _leave_payload(leave)
+		# A request spanning a weekend only marks the days that were worked or expected.
+		home = _leave_on(home_office, current)
+		worked = bool(item["first_checkin"])
+		item["home_office"] = (
+			_home_office_payload(home, current) if home and (expected or worked) and not holiday else None
+		)
 		days.append(item)
 		current = add_days(current, 1)
 
@@ -202,10 +354,7 @@ def get_my_workdays(year=None, month=None):
 	if not year or not month:
 		year, month = today.year, today.month
 	start, end = _month_bounds(year, month)
-	if end > today:
-		end = today
 	days = _days_for_range(employee, start, end)
-	days.reverse()
 	return {
 		"year": int(year),
 		"month": int(month),
@@ -651,13 +800,29 @@ def _usual_start_time(employee, log_date):
 	return time(mid // 60, mid % 60)
 
 
+def _typical_day_hours(default):
+	if default and default.name:
+		hours = frappe.get_all(
+			"Daily Hours Detail",
+			filters={"parent": default.name, "parenttype": "Weekly Working Hours", "hours": [">", 0]},
+			pluck="hours",
+			ignore_permissions=True,
+		)
+		if hours:
+			return max(flt(value) for value in hours)
+	return 8
+
+
 def _suggestion_for_day(employee, log_date, checkins):
 	default = get_employee_default_work_hour(employee, log_date, skip_workday_if_no_weekly_hours=1)
-	if default:
-		target = flt(default.hours)
-		break_minutes = cint(default.break_minutes or 0)
-	else:
-		target = 8 if checkins else 0
+	target = flt(default.hours) if default else 0
+	break_minutes = cint(default.break_minutes or 0) if default else 0
+	free_day = target <= 0
+	if free_day:
+		if not checkins:
+			return None
+		# A free day has no target. Size an open check-in by a normal working day.
+		target = _typical_day_hours(default)
 		break_minutes = 0
 
 	suggestion = suggest_missing_punch(
@@ -673,6 +838,10 @@ def _suggestion_for_day(employee, log_date, checkins):
 	)
 	if suggestion and suggestion.get("time"):
 		suggestion["time"] = get_datetime(suggestion["time"]).strftime("%Y-%m-%d %H:%M:%S")
+	if suggestion and free_day:
+		suggestion["reason"] = suggestion["reason"].replace(
+			_("h target"), _("h of a normal working day")
+		)
 	return suggestion
 
 
@@ -691,6 +860,7 @@ def get_my_day(date):
 		"first_checkin": "",
 		"last_checkout": "",
 		"needs_attention": False,
+		"schedule": "none",
 	}
 	from hr_addon.hr_addon.doctype.workday.workday import get_employee_checkin
 
@@ -706,6 +876,7 @@ def get_my_day(date):
 		)
 	day["checkins"] = checkins
 	day["suggestion"] = _suggestion_for_day(employee, log_date, checkins)
+	day["completely_missing"] = day.get("status") == "Missing" and not checkins
 	return day
 
 

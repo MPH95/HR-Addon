@@ -9,7 +9,42 @@ import frappe
 from frappe.tests.utils import FrappeTestCase
 from frappe.utils import getdate
 
-from hr_addon.api.employee_app import _validated_log, suggest_missing_punch, summarize_hours
+from hr_addon.api.employee_app import (
+	_validated_log,
+	describe_empty_day,
+	schedule_kind,
+	suggest_missing_punch,
+	summarize_hours,
+)
+
+
+class TestEmptyWorkday(FrappeTestCase):
+	def test_past_workday_without_a_punch_is_missing(self):
+		status, attention = describe_empty_day("2026-09-16", "2026-09-28", True, False)
+		self.assertEqual(status, "Missing")
+		self.assertTrue(attention)
+
+	def test_holiday_and_weekend_are_not_missing(self):
+		self.assertEqual(describe_empty_day("2026-09-16", "2026-09-28", True, True), ("Holiday", False))
+		self.assertEqual(describe_empty_day("2026-09-19", "2026-09-28", False, False), ("Off", False))
+
+	def test_leave_covers_a_day_with_no_checkin(self):
+		self.assertEqual(describe_empty_day("2026-09-16", "2026-09-28", True, False, 1), ("On Leave", False))
+		self.assertEqual(
+			describe_empty_day("2026-09-16", "2026-09-28", True, False, 0),
+			("Pending Leave", False),
+		)
+
+	def test_zero_hour_weekday_is_a_free_day(self):
+		self.assertEqual(schedule_kind(SimpleNamespace(hours=8)), "work")
+		self.assertEqual(schedule_kind(SimpleNamespace(hours=0)), "free")
+		self.assertEqual(schedule_kind(None), "none")
+		# A free day without check-ins is never flagged as missing.
+		self.assertEqual(describe_empty_day("2026-09-26", "2026-09-28", False, False), ("Off", False))
+
+	def test_today_and_future_stay_open(self):
+		self.assertEqual(describe_empty_day("2026-09-28", "2026-09-28", True, False), ("Open", False))
+		self.assertEqual(describe_empty_day("2026-09-29", "2026-09-28", True, False), ("Open", False))
 
 
 class TestEmployeeAppHours(FrappeTestCase):
