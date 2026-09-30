@@ -21,9 +21,8 @@ ATTENTION_STATUSES = {"Missing Checkin", "Absent", "Missing"}
 CLOSE_GAP = timedelta(minutes=20)
 # A punch this close to the expected end of the day is treated as the checkout.
 LOOKS_LIKE_END = timedelta(minutes=90)
-# These mechanisms subtract the scheduled break from a single check-in/out span.
-SCHEDULED_BREAK_MECHANISMS = {
-	"Break Hours from Weekly Working Hours",
+# On-site mechanisms credit first-in to last-out, minus the break that applies.
+ON_SITE_BREAK_MECHANISMS = {
 	"Break Hours from Weekly Working Hours if Shorter breaks",
 	"Break Hours from Minimum Break Rule",
 }
@@ -129,7 +128,74 @@ def get_my_hours_summary():
 	summary["month"] = today.month
 	summary["year"] = today.year
 	summary["missing_days"] = _missing_day_count(employee, getdate(f"{today.year}-{today.month:02d}-01"), today)
+	today_view = _days_for_range(employee, today, today)
+	summary["today_target"] = flt(today_view[0]["target_hours"], 2) if today_view else 0
+	summary["today_actual"], summary["today_open"] = _today_worked_hours(employee, today)
+	summary["overtime_enabled"] = bool(
+		cint(frappe.db.get_single_value("HR Addon Settings", "enable_overtime_ledger_feature"))
+	)
+	summary["overtime_balance"] = _overtime_balance(employee) if summary["overtime_enabled"] else None
 	return summary
+
+
+def _today_worked_hours(employee, today):
+	"""Hours credited so far today, using the same break rules as a workday.
+
+	An open check-in is closed at the current time so the minimum break for
+	that on-site duration is included. Nothing is saved.
+	"""
+	from hr_addon.hr_addon.doctype.workday.workday import get_employee_checkin
+
+	default = get_employee_default_work_hour(employee, today, skip_workday_if_no_weekly_hours=1)
+	return preview_actual_hours(get_employee_checkin(employee, today), default, now_datetime())
+
+
+def preview_actual_hours(checkins, work_hour, at=None):
+	"""Credited hours for these punches. An open check-in is closed at `at`."""
+	from hr_addon.hr_addon.doctype.workday.workday import get_workday
+
+	rows = []
+	for row in checkins or []:
+		rows.append(
+			frappe._dict(
+				time=row.get("time") if isinstance(row, dict) else row.time,
+				log_type=row.get("log_type") if isinstance(row, dict) else row.log_type,
+				attendance=(row.get("attendance") if isinstance(row, dict) else getattr(row, "attendance", ""))
+				or "",
+			)
+		)
+	if not rows:
+		return 0, False
+
+	open_shift = len(rows) % 2 == 1
+	if open_shift:
+		at = get_datetime(at or now_datetime()).replace(microsecond=0)
+		last = get_datetime(rows[-1].time)
+		if at < last:
+			at = last
+		rows.append(frappe._dict(time=at, log_type="OUT", attendance=rows[0].attendance or ""))
+
+	if not work_hour:
+		work_hour = frappe._dict(hours=0, break_minutes=0, no_break_hours=0)
+	result = get_workday(rows, work_hour, cint(getattr(work_hour, "no_break_hours", 0)))
+	return flt(result.get("actual_working_hours"), 2), open_shift
+
+
+def _overtime_balance(employee):
+	"""Latest overtime ledger balance. None when the feature is switched off."""
+	if not cint(frappe.db.get_single_value("HR Addon Settings", "enable_overtime_ledger_feature")):
+		return None
+	row = frappe.get_all(
+		"Overtime Ledger Entry",
+		filters={"employee": employee, "is_cancelled": 0},
+		fields=["balance_after"],
+		order_by="posting_datetime desc, creation desc",
+		limit=1,
+		ignore_permissions=True,
+	)
+	if not row:
+		return 0
+	return flt(row[0].balance_after, 2)
 
 
 def _missing_day_count(employee, start, today):
@@ -364,7 +430,7 @@ def get_my_workdays(year=None, month=None):
 
 
 def suggest_missing_punch(
-	checkins, date, target_hours, break_minutes, mechanism, usual_start, now
+	checkins, date, target_hours, break_minutes, mechanism, usual_start, now, no_break_hours=False
 ):
 	"""Propose one punch that repairs a broken check-in sequence.
 
@@ -377,6 +443,7 @@ def suggest_missing_punch(
 	now = get_datetime(now).replace(microsecond=0)
 	target_hours = flt(target_hours)
 	break_minutes = cint(break_minutes or 0)
+	no_break_hours = bool(no_break_hours)
 	punches = _normalize_punches(checkins)
 
 	if not punches:
@@ -400,12 +467,20 @@ def suggest_missing_punch(
 	mismatch = _first_mismatch(punches)
 	if mismatch is not None:
 		return _suggestion_for_mismatch(
-			punches, mismatch, date, target_hours, break_minutes, mechanism, usual_start, now
+			punches,
+			mismatch,
+			date,
+			target_hours,
+			break_minutes,
+			mechanism,
+			usual_start,
+			now,
+			no_break_hours,
 		)
 
 	if len(punches) % 2 == 1:
 		return _suggestion_for_open_checkin(
-			punches, date, target_hours, break_minutes, mechanism, now
+			punches, date, target_hours, break_minutes, mechanism, now, no_break_hours
 		)
 
 	if len(punches) == 2 and punches[1]["time"] - punches[0]["time"] <= CLOSE_GAP:
@@ -421,18 +496,20 @@ def suggest_missing_punch(
 			_(
 				"Check-out is only a few minutes after check-in. {0} matches your {1} h target."
 			),
+			0,
+			no_break_hours,
 		)
 
 	return None
 
 
 def _suggestion_for_mismatch(
-	punches, index, date, target_hours, break_minutes, mechanism, usual_start, now
+	punches, index, date, target_hours, break_minutes, mechanism, usual_start, now, no_break_hours=False
 ):
 	punch = punches[index]
 	if index == 0:
 		when = _checkin_before(
-			date, punch["time"], target_hours, break_minutes, mechanism, usual_start
+			date, punch["time"], target_hours, break_minutes, mechanism, usual_start, no_break_hours
 		)
 		return _accept(
 			_proposal(
@@ -478,6 +555,8 @@ def _suggestion_for_mismatch(
 					"Two check-ins a few minutes apart. The later one is changed into a check-out at {0}, "
 					"which covers your {1} h target."
 				),
+				index - 1,
+				no_break_hours,
 			)
 
 		expected = _expected_out(
@@ -500,7 +579,7 @@ def _suggestion_for_mismatch(
 				later_than=previous["time"],
 			)
 
-		when = _just_before(previous["time"], punch["time"], break_minutes)
+		when = _just_before(punches, previous["time"], punch["time"], break_minutes, mechanism)
 		return _accept(
 			_proposal(
 				"add",
@@ -527,7 +606,7 @@ def _suggestion_for_mismatch(
 			"reason": _("Two check-outs a few minutes apart. The later one looks like a duplicate."),
 		}
 
-	when = _return_checkin(punches, index, target_hours, break_minutes)
+	when = _return_checkin(punches, index, target_hours, break_minutes, mechanism, no_break_hours)
 	return _accept(
 		_proposal(
 			"add",
@@ -546,7 +625,9 @@ def _suggestion_for_mismatch(
 	)
 
 
-def _suggestion_for_open_checkin(punches, date, target_hours, break_minutes, mechanism, now):
+def _suggestion_for_open_checkin(
+	punches, date, target_hours, break_minutes, mechanism, now, no_break_hours=False
+):
 	last = punches[-1]
 	if (
 		len(punches) >= 2
@@ -565,10 +646,10 @@ def _suggestion_for_open_checkin(punches, date, target_hours, break_minutes, mec
 
 	open_index = len(punches) - 1
 	expected = _expected_out(
-		last["time"], punches, open_index, target_hours, break_minutes, mechanism
+		last["time"], punches, open_index, target_hours, break_minutes, mechanism, no_break_hours
 	)
 	completed = _completed_hours(punches, open_index)
-	remaining = max(flt(target_hours) - completed, 0)
+	remaining = max(flt(target_hours) - _credited_hours(punches, open_index, break_minutes, mechanism, no_break_hours), 0)
 	if completed <= 0:
 		reason = _(
 			"You checked in at {0} and never checked out. A check-out at {1} matches your {2} h target."
@@ -592,9 +673,21 @@ def _suggestion_for_open_checkin(punches, date, target_hours, break_minutes, mec
 
 
 def _checkout_at_target(
-	punches, punch, open_time, date, target_hours, break_minutes, mechanism, now, reason_template
+	punches,
+	punch,
+	open_time,
+	date,
+	target_hours,
+	break_minutes,
+	mechanism,
+	now,
+	reason_template,
+	open_index=0,
+	no_break_hours=False,
 ):
-	expected = open_time + _as_timedelta(_span_hours(target_hours, break_minutes, mechanism))
+	expected = _expected_out(
+		open_time, punches, open_index, target_hours, break_minutes, mechanism, no_break_hours
+	)
 	reason = reason_template.format(expected.strftime("%H:%M"), _hours_label(target_hours))
 	return _accept(
 		_proposal("correct", "OUT", expected, reason, name=punch["name"]),
@@ -706,20 +799,31 @@ def _first_mismatch(punches):
 	return None
 
 
-def _span_hours(target_hours, break_minutes, mechanism):
-	extra = flt(break_minutes) / 60 if mechanism in SCHEDULED_BREAK_MECHANISMS else 0
-	return flt(target_hours) + extra
+def _span_hours(target_hours, break_minutes, mechanism, no_break_hours=False):
+	return _open_segment_minutes(target_hours, break_minutes, mechanism, 0, 0, 0, no_break_hours) / 60
 
 
-def _expected_out(open_time, punches, open_index, target_hours, break_minutes, mechanism):
+def _expected_out(open_time, punches, open_index, target_hours, break_minutes, mechanism, no_break_hours=False):
+	"""Checkout that makes the credited hours reach the target.
+
+	The break is the one get_workday would subtract: the real gaps, the
+	weekly break, or the mandatory minimum for the on-site duration.
+	"""
+	open_time = get_datetime(open_time)
 	completed = _completed_hours(punches, open_index)
-	if completed <= 0 and open_index == 0:
-		duration = _span_hours(target_hours, break_minutes, mechanism)
-	else:
-		duration = max(flt(target_hours) - completed, 0)
-		if duration <= 0:
-			return get_datetime(open_time) + timedelta(minutes=1)
-	return get_datetime(open_time) + _as_timedelta(duration)
+	breaks = _breaks_before(punches, open_index)
+	minutes = _open_segment_minutes(
+		target_hours,
+		break_minutes,
+		mechanism,
+		completed,
+		breaks,
+		completed + breaks,
+		no_break_hours,
+	)
+	if minutes <= 0:
+		return open_time + timedelta(minutes=1)
+	return open_time + timedelta(minutes=minutes)
 
 
 def _completed_hours(punches, before_index):
@@ -731,15 +835,27 @@ def _completed_hours(punches, before_index):
 	return hours
 
 
-def _checkin_before(date, out_time, target_hours, break_minutes, mechanism, usual_start):
+def _breaks_before(punches, before_index):
+	"""Gaps between a check-out and the next check-in, up to and including `before_index`."""
+	hours = 0.0
+	index = 1
+	while index + 1 <= before_index:
+		hours += (punches[index + 1]["time"] - punches[index]["time"]).total_seconds() / 3600
+		index += 2
+	return hours
+
+
+def _checkin_before(date, out_time, target_hours, break_minutes, mechanism, usual_start, no_break_hours=False):
 	usual = datetime.combine(date, usual_start)
 	if usual < get_datetime(out_time):
 		return usual
-	return get_datetime(out_time) - _as_timedelta(_span_hours(target_hours, break_minutes, mechanism))
+	return get_datetime(out_time) - timedelta(
+		minutes=_open_segment_minutes(target_hours, break_minutes, mechanism, 0, 0, 0, no_break_hours)
+	)
 
 
-def _just_before(previous_time, next_time, break_minutes):
-	gap = timedelta(minutes=break_minutes or 30)
+def _just_before(punches, previous_time, next_time, break_minutes, mechanism):
+	gap = _break_gap(punches, next_time, break_minutes, mechanism)
 	when = get_datetime(next_time) - gap
 	if when <= get_datetime(previous_time):
 		when = get_datetime(previous_time) + timedelta(minutes=1)
@@ -748,20 +864,118 @@ def _just_before(previous_time, next_time, break_minutes):
 	return when
 
 
-def _return_checkin(punches, index, target_hours, break_minutes):
+def _return_checkin(punches, index, target_hours, break_minutes, mechanism, no_break_hours=False):
+	"""Check-in between two check-outs so the closed day credits the target."""
 	previous = punches[index - 1]["time"]
 	later = punches[index]["time"]
+	earliest = previous + timedelta(minutes=1)
+	latest = later - timedelta(minutes=1)
+	if earliest > latest:
+		return latest
+
+	best = None
+	minute = latest
+	while minute >= earliest:
+		if _actual_with_return(punches, index, minute, break_minutes, mechanism, no_break_hours) + 1e-6 >= flt(
+			target_hours
+		):
+			best = minute
+			break
+		minute -= timedelta(minutes=1)
+	return best or earliest
+
+
+def _break_gap(punches, next_time, break_minutes, mechanism):
+	"""Minutes to leave before the next punch, matching the break that would be deducted."""
+	scheduled = cint(break_minutes or 0)
+	if mechanism == "Break Hours from Minimum Break Rule" and punches:
+		on_site = (get_datetime(next_time) - punches[0]["time"]).total_seconds() / 3600
+		minutes = int(round(_mandatory_break_hours(on_site) * 60))
+		return timedelta(minutes=max(minutes, 1))
+	return timedelta(minutes=scheduled or 30)
+
+
+def _open_segment_minutes(
+	target_hours, break_minutes, mechanism, completed, breaks_taken, prior_on_site, no_break_hours=False
+):
+	"""Minutes still to work so credited hours reach the target."""
+	target = flt(target_hours)
+
+	def credited(minutes):
+		segment = minutes / 60
+		return _actual_hours(
+			completed + segment,
+			prior_on_site + segment,
+			breaks_taken,
+			break_minutes,
+			mechanism,
+			no_break_hours,
+		)
+
+	if credited(0) >= target - 1e-6:
+		return 0
+	lo, hi = 0, 16 * 60
+	best = hi
+	while lo <= hi:
+		mid = (lo + hi) // 2
+		if credited(mid) >= target - 1e-6:
+			best = mid
+			hi = mid - 1
+		else:
+			lo = mid + 1
+	return best
+
+
+def _credited_hours(punches, open_index, break_minutes, mechanism, no_break_hours):
+	completed = _completed_hours(punches, open_index)
+	breaks = _breaks_before(punches, open_index)
+	return _actual_hours(completed, completed + breaks, breaks, break_minutes, mechanism, no_break_hours)
+
+
+def _actual_with_return(punches, index, checkin_time, break_minutes, mechanism, no_break_hours):
+	previous = punches[index - 1]["time"]
+	later = punches[index]["time"]
+	first = punches[0]["time"]
 	completed = _completed_hours(punches, index)
-	remaining = max(flt(target_hours) - completed, 0)
-	if remaining <= 0:
-		when = previous + timedelta(minutes=break_minutes or 30)
-	else:
-		when = later - _as_timedelta(remaining)
-	if when <= previous:
-		when = previous + timedelta(minutes=max(break_minutes, 1))
-	if when >= later:
-		when = later - timedelta(minutes=1)
-	return when
+	earlier_breaks = _breaks_before(punches, index - 1)
+	gap = max((checkin_time - previous).total_seconds() / 3600, 0)
+	hours_worked = completed + max((later - checkin_time).total_seconds() / 3600, 0)
+	on_site = max((later - first).total_seconds() / 3600, 0)
+	return _actual_hours(
+		hours_worked, on_site, earlier_breaks + gap, break_minutes, mechanism, no_break_hours
+	)
+
+
+def _actual_hours(hours_worked, on_site, breaks_taken, break_minutes, mechanism, no_break_hours=False):
+	"""Same credited hours as calculate_actual_working_hours for a closed day."""
+	hours_worked = flt(hours_worked)
+	on_site = flt(on_site)
+	if no_break_hours and hours_worked < 6:
+		return hours_worked
+	resolved = _resolved_break(on_site, breaks_taken, break_minutes, mechanism)
+	if mechanism in ON_SITE_BREAK_MECHANISMS and on_site > 0:
+		return flt(on_site - resolved)
+	return flt(hours_worked - resolved)
+
+
+def _resolved_break(on_site, breaks_taken, break_minutes, mechanism):
+	"""Break hours get_workday stores for this mechanism."""
+	breaks_taken = flt(breaks_taken)
+	scheduled = flt(break_minutes) / 60
+	if mechanism == "Break Hours from Weekly Working Hours":
+		return scheduled
+	if mechanism == "Break Hours from Weekly Working Hours if Shorter breaks":
+		return scheduled if breaks_taken <= scheduled else breaks_taken
+	if mechanism == "Break Hours from Minimum Break Rule":
+		mandatory = _mandatory_break_hours(on_site)
+		return mandatory if breaks_taken <= mandatory else breaks_taken
+	return breaks_taken
+
+
+def _mandatory_break_hours(on_site_hours):
+	from hr_addon.hr_addon.doctype.workday.workday import get_mandatory_break_hours_from_settings
+
+	return flt(get_mandatory_break_hours_from_settings(on_site_hours))
 
 
 def _as_timedelta(hours):
@@ -835,6 +1049,7 @@ def _suggestion_for_day(employee, log_date, checkins):
 		),
 		usual_start=_usual_start_time(employee, log_date),
 		now=now_datetime(),
+		no_break_hours=bool(default and default.no_break_hours),
 	)
 	if suggestion and suggestion.get("time"):
 		suggestion["time"] = get_datetime(suggestion["time"]).strftime("%Y-%m-%d %H:%M:%S")

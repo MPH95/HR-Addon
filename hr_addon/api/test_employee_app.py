@@ -12,10 +12,20 @@ from frappe.utils import getdate
 from hr_addon.api.employee_app import (
 	_validated_log,
 	describe_empty_day,
+	preview_actual_hours,
 	schedule_kind,
 	suggest_missing_punch,
 	summarize_hours,
 )
+
+
+def _mandatory_break(on_site):
+	"""Same brackets as the default Minimum Break Rule."""
+	if on_site <= 6:
+		return 0
+	if on_site <= 9:
+		return 0.5
+	return 0.75
 
 
 class TestEmptyWorkday(FrappeTestCase):
@@ -141,7 +151,7 @@ class TestSuggestMissingPunch(FrappeTestCase):
 
 		self.assertEqual(result["action"], "add")
 		self.assertEqual(result["log_type"], "OUT")
-		self.assertEqual(result["time"], datetime(2026, 9, 23, 16, 30))
+		self.assertEqual(result["time"], datetime(2026, 9, 23, 17, 0))
 
 	def test_two_close_checkins_become_a_checkout(self):
 		result = self._suggest(
@@ -210,7 +220,7 @@ class TestSuggestMissingPunch(FrappeTestCase):
 
 		self.assertEqual(result["action"], "add")
 		self.assertEqual(result["log_type"], "IN")
-		self.assertEqual(result["time"], datetime(2026, 9, 23, 12, 30))
+		self.assertEqual(result["time"], datetime(2026, 9, 23, 12, 15))
 
 	def test_duplicate_checkout_is_removed(self):
 		result = self._suggest(
@@ -281,3 +291,85 @@ class TestSuggestMissingPunch(FrappeTestCase):
 
 		self.assertEqual(result["time"], datetime(2026, 9, 23, 23, 59))
 		self.assertIn("23:59", result["reason"])
+
+	@patch("hr_addon.api.employee_app._mandatory_break_hours", side_effect=_mandatory_break)
+	def test_minimum_break_is_added_when_the_weekly_break_is_zero(self, _mock):
+		result = self._suggest(
+			[_punch("a", "IN", "2026-09-23 08:00:00")],
+			break_minutes=0,
+			mechanism="Break Hours from Minimum Break Rule",
+		)
+
+		self.assertEqual(result["time"], datetime(2026, 9, 23, 16, 30))
+
+	@patch("hr_addon.api.employee_app._mandatory_break_hours", side_effect=_mandatory_break)
+	def test_short_day_does_not_get_the_long_day_break(self, _mock):
+		result = self._suggest(
+			[_punch("a", "IN", "2026-09-23 08:00:00")],
+			target=4,
+			break_minutes=30,
+			mechanism="Break Hours from Minimum Break Rule",
+		)
+
+		self.assertEqual(result["time"], datetime(2026, 9, 23, 12, 0))
+
+	@patch("hr_addon.api.employee_app._mandatory_break_hours", side_effect=_mandatory_break)
+	def test_short_lunch_is_extended_to_the_mandatory_break(self, _mock):
+		result = self._suggest(
+			[
+				_punch("a", "IN", "2026-09-23 08:00:00"),
+				_punch("b", "OUT", "2026-09-23 12:00:00"),
+				_punch("c", "IN", "2026-09-23 12:25:00"),
+			],
+			break_minutes=0,
+			mechanism="Break Hours from Minimum Break Rule",
+		)
+
+		self.assertEqual(result["time"], datetime(2026, 9, 23, 16, 30))
+
+	@patch("hr_addon.api.employee_app._mandatory_break_hours", side_effect=_mandatory_break)
+	def test_missing_checkout_leaves_the_mandatory_gap(self, _mock):
+		result = self._suggest(
+			[
+				_punch("a", "IN", "2026-09-23 08:00:00"),
+				_punch("b", "IN", "2026-09-23 14:30:00"),
+			],
+			break_minutes=0,
+			mechanism="Break Hours from Minimum Break Rule",
+		)
+
+		self.assertEqual(result["action"], "add")
+		self.assertEqual(result["log_type"], "OUT")
+		self.assertEqual(result["time"], datetime(2026, 9, 23, 14, 0))
+
+
+class TestPreviewActualHours(FrappeTestCase):
+	# An open check-in is closed at the given time and scored like a workday.
+	def test_open_checkin_deducts_the_mandatory_break(self):
+		settings = SimpleNamespace(
+			workday_break_calculation_mechanism="Break Hours from Minimum Break Rule",
+			swap_hours_worked_and_actual_working_hours=0,
+			minimum_break_rule=[
+				SimpleNamespace(from_hours=0, to_hours=6, minimum_break_minutes=0),
+				SimpleNamespace(from_hours=6, to_hours=9, minimum_break_minutes=30),
+				SimpleNamespace(from_hours=9, to_hours=100, minimum_break_minutes=45),
+			],
+		)
+		checkins = [frappe._dict(time="2026-09-23 08:00:00", log_type="IN", attendance="")]
+		work_hour = frappe._dict(hours=8, break_minutes=0, no_break_hours=0)
+		with (
+			patch(
+				"hr_addon.hr_addon.doctype.workday.workday.frappe.get_cached_doc",
+				return_value=settings,
+			),
+			patch(
+				"hr_addon.hr_addon.doctype.workday.workday.frappe.db.get_value",
+				return_value=None,
+			),
+		):
+			actual, open_shift = preview_actual_hours(
+				checkins, work_hour, datetime(2026, 9, 23, 16, 30)
+			)
+
+		self.assertTrue(open_shift)
+		self.assertAlmostEqual(actual, 8.0)
