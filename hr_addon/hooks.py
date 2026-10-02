@@ -34,6 +34,9 @@ doctype_js = {
 required_apps = ["hrms"]
 
 doc_events = {
+	"Timesheet": {
+		"before_validate": "hr_addon.api.project_time.keep_project_hours_internal",
+	},
 	"Leave Application": {
 		"validate": "hr_addon.events.leave_application.validate_leave_application",
 		"on_change": "hr_addon.hr_addon.doctype.hr_addon_settings.hr_addon_settings.export_calendar",
@@ -42,6 +45,10 @@ doc_events = {
 			"hr_addon.events.leave_application.restore_overtime_on_leave_cancel",
 		],
 		"on_submit": "hr_addon.events.leave_application.reduce_overtime_on_leave_submit",
+	},
+	"Employee Checkin": {
+		"on_update": "hr_addon.events.employee_checkin.enqueue_workday_sync",
+		"on_trash": "hr_addon.events.employee_checkin.enqueue_workday_sync",
 	},
 	"Attendance": {
 		"on_submit": "hr_addon.events.attendance.create_overtime_ledger_entry_on_attendance_submit",

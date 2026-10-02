@@ -165,11 +165,35 @@ class TestGetUnmarkedDays(FrappeTestCase):
 
 class TestGetUnmarkedRange(FrappeTestCase):
 	# get_unmarked_range: returns empty list when employee has no weekly working hours.
+	@patch("hr_addon.hr_addon.doctype.workday.workday.frappe.get_list", return_value=[])
+	@patch(
+		"hr_addon.hr_addon.doctype.workday.workday.frappe.get_cached_value",
+		return_value=(None, None),
+	)
 	@patch("hr_addon.hr_addon.doctype.workday.workday.get_employee_default_work_hour")
-	def test_get_unmarked_range_returns_empty_without_weekly_hours(self, mock_edwh):
+	def test_get_unmarked_range_returns_empty_without_weekly_hours(
+		self, mock_edwh, _mock_cached_value, _mock_get_list
+	):
 		mock_edwh.return_value = None
 		result = get_unmarked_range("HR-EMP-00001", "2026-06-01", "2026-06-07")
 		self.assertEqual(result, [])
+
+	# get_unmarked_range: one weekday without hours row must not discard the whole range.
+	@patch("hr_addon.hr_addon.doctype.workday.workday.frappe.get_list", return_value=[])
+	@patch(
+		"hr_addon.hr_addon.doctype.workday.workday.frappe.get_cached_value",
+		return_value=(None, None),
+	)
+	@patch("hr_addon.hr_addon.doctype.workday.workday.get_employee_default_work_hour")
+	def test_get_unmarked_range_skips_only_dates_without_weekly_hours(
+		self, mock_edwh, _mock_cached_value, _mock_get_list
+	):
+		def work_hour_for_date(employee, date, skip_workday_if_no_weekly_hours=None):
+			return None if str(date) == "2026-06-01" else _make_default_work_hour()
+
+		mock_edwh.side_effect = work_hour_for_date
+		result = get_unmarked_range("HR-EMP-00001", "2026-06-01", "2026-06-03")
+		self.assertEqual(result, ["2026-06-02", "2026-06-03"])
 
 	# get_unmarked_range: returns dates in range without existing workdays.
 	@patch("hr_addon.hr_addon.doctype.workday.workday.frappe.get_list")
@@ -755,6 +779,43 @@ class TestWorkdayHolidayLeaveOverride(FrappeTestCase):
 		mock_apply.assert_called_once()
 		mock_cancel.assert_called_once()
 
+	# _should_revert_leave_to_not_workday: Half Day without approved leave keeps its hours.
+	@patch.object(Workday, "_get_submitted_leave_application_name", return_value=None)
+	def test_should_not_revert_without_submitted_leave_application(self, _mock_leave):
+		wd = Workday(
+			{
+				"doctype": "Workday",
+				"employee": "HR-EMP-00001",
+				"log_date": "2026-06-06",
+				"company": "_Test Company",
+				"status": "Half Day",
+			}
+		)
+		self.assertFalse(wd._should_revert_leave_to_not_workday(1))
+
+	# update_status: zero-hour weekday without checkins becomes Not Workday, not Absent.
+	@patch(
+		"hr_addon.hr_addon.doctype.workday.workday.is_non_working_day_for_employee",
+		return_value=True,
+	)
+	@patch(
+		"hr_addon.hr_addon.doctype.workday.workday.frappe.db.get_single_value",
+		return_value=1,
+	)
+	def test_update_status_marks_zero_hour_day_as_not_workday(
+		self, _mock_setting, _mock_non_working
+	):
+		wd = Workday(
+			{
+				"doctype": "Workday",
+				"employee": "HR-EMP-00001",
+				"log_date": "2026-06-06",
+				"company": "_Test Company",
+			}
+		)
+		wd.update_status()
+		self.assertEqual(wd.status, "Not Workday")
+
 	@patch("hr_addon.hr_addon.doctype.workday.workday._create_new_attendance")
 	@patch("hr_addon.hr_addon.doctype.workday.workday._get_submitted_attendance_for_workday", return_value=None)
 	@patch("hr_addon.events.overtime_ledger.is_overtime_ledger_enabled", return_value=True)
@@ -869,7 +930,7 @@ class TestGenerateWorkdaysForPast7DaysNow(FrappeTestCase):
 
 		mock_get_doc.side_effect = get_doc_side_effect
 		generate_workdays_for_past_7_days_now()
-		self.assertEqual(log_doc.status, "Failed")
+		self.assertEqual(log_doc.status, "Completed")
 		self.assertEqual(log_doc.total_employees, 0)
 
 
