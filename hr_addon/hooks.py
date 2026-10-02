@@ -34,6 +34,9 @@ doctype_js = {
 required_apps = ["hrms"]
 
 doc_events = {
+	"Timesheet": {
+		"before_validate": "hr_addon.api.project_time.keep_project_hours_internal",
+	},
 	"Leave Application": {
 		"validate": "hr_addon.events.leave_application.validate_leave_application",
 		"on_change": "hr_addon.hr_addon.doctype.hr_addon_settings.hr_addon_settings.export_calendar",
