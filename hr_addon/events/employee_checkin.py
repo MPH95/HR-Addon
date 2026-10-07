@@ -64,6 +64,11 @@ def sync_workday(employee, log_date):
 		return
 
 	setattr(frappe.flags, SYNC_FLAG, True)
+	# A failed workday update must not undo the check-in the employee just saved.
+	# Rolling back the whole request did that, so the punch vanished and the app
+	# looked like the button had done nothing.
+	save_point = "workday_checkin_sync"
+	frappe.db.savepoint(save_point)
 	try:
 		if workday_name:
 			workday = frappe.get_doc("Workday", workday_name)
@@ -75,9 +80,10 @@ def sync_workday(employee, log_date):
 
 		workday.flags.ignore_permissions = True
 		workday.save()
+		frappe.db.release_savepoint(save_point)
 		frappe.db.commit()
 	except Exception:
-		frappe.db.rollback()
+		frappe.db.rollback(save_point=save_point)
 		frappe.log_error(
 			title="HR Addon: Workday sync from Employee Checkin",
 			message=f"Employee {employee}, date {log_date}\n\n{frappe.get_traceback()}",

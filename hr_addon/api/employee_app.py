@@ -1106,6 +1106,14 @@ def _validated_log(log_type, time):
 	return log_type, timestamp
 
 
+def _apply_coordinates(doc, employee, latitude=None, longitude=None):
+	"""Keep a live check-in's GPS, otherwise reuse the last known position."""
+	if latitude not in (None, "") and longitude not in (None, ""):
+		doc.latitude = flt(latitude)
+		doc.longitude = flt(longitude)
+	_fill_coordinates(doc, employee)
+
+
 def _fill_coordinates(doc, employee):
 	"""Reuse the last known coordinates when geolocation is required.
 
@@ -1130,7 +1138,7 @@ def _fill_coordinates(doc, employee):
 
 
 @frappe.whitelist()
-def save_my_checkin(log_type, time, name=None):
+def save_my_checkin(log_type, time, name=None, latitude=None, longitude=None):
 	"""Create or correct the current employee's check-in, then rebuild that Workday.
 
 	The Time field on Employee Checkin is permlevel 1, so an Employee cannot
@@ -1155,9 +1163,9 @@ def save_my_checkin(log_type, time, name=None):
 		previous_date = getdate(doc.time)
 		doc.log_type = log_type
 		doc.time = timestamp
-		_fill_coordinates(doc, employee)
+		_apply_coordinates(doc, employee, latitude, longitude)
 		doc.flags.ignore_permissions = True
-		doc.save()
+		doc.save(ignore_permissions=True)
 	else:
 		previous_date = None
 		doc = frappe.get_doc(
@@ -1168,9 +1176,8 @@ def save_my_checkin(log_type, time, name=None):
 				"time": timestamp,
 			}
 		)
-		_fill_coordinates(doc, employee)
-		doc.flags.ignore_permissions = True
-		doc.insert()
+		_apply_coordinates(doc, employee, latitude, longitude)
+		doc.insert(ignore_permissions=True)
 
 	from hr_addon.events.employee_checkin import sync_workday
 

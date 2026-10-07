@@ -12,6 +12,7 @@ from hr_addon.events.employee_checkin import (
 	enqueue_workday_sync,
 	sync_workday,
 )
+from hr_addon.hr_addon.doctype.workday.workday import _create_new_attendance
 
 
 def _make_checkin(time="2026-07-25 09:00:00", employee="HR-EMP-00001", previous_time=None):
@@ -141,6 +142,30 @@ class TestSyncWorkday(FrappeTestCase):
 		workday.save.side_effect = Exception("boom")
 		mock_get_doc.return_value = workday
 		sync_workday("HR-EMP-00001", "2026-07-25")
-		mock_rollback.assert_called_once()
+		mock_rollback.assert_called_once_with(save_point="workday_checkin_sync")
 		mock_log_error.assert_called_once()
 		self.assertFalse(getattr(frappe.flags, SYNC_FLAG, False))
+
+
+class TestAttendanceIgnoresEmployeePermissions(FrappeTestCase):
+	@patch("hr_addon.hr_addon.doctype.workday.workday.frappe.msgprint")
+	@patch("hr_addon.hr_addon.doctype.workday.workday.frappe.db.commit")
+	@patch("hr_addon.hr_addon.doctype.workday.workday.frappe.db.set_value")
+	@patch("hr_addon.hr_addon.doctype.workday.workday.frappe.get_doc")
+	def test_new_attendance_is_inserted_without_the_employee_permission(
+		self, mock_get_doc, _set_value, _commit, _msgprint
+	):
+		attendance = MagicMock()
+		mock_get_doc.return_value = attendance
+		doc = SimpleNamespace(
+			name="WD-1",
+			employee="HR-EMP-00001",
+			company="Movaria",
+			log_date="2026-10-01",
+			first_checkin=None,
+			last_checkout=None,
+		)
+		_create_new_attendance(doc, 0, "Present", 8, 8)
+		attendance.insert.assert_called_once_with(ignore_permissions=True)
+		self.assertTrue(attendance.flags.ignore_permissions)
+		attendance.submit.assert_called_once()

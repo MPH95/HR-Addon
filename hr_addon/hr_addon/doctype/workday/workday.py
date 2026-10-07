@@ -1753,10 +1753,13 @@ def _create_new_attendance(doc, hour_variance, att_status, target_for_att, actua
         row["leave_application"] = leave_info.name
         row["leave_type"] = leave_info.leave_type
     attendance = frappe.get_doc(row)
+    # The punch is saved by the employee. Attendance is a side effect of the
+    # workday, so it must not depend on that user being allowed to create one.
+    attendance.flags.ignore_permissions = True
     prev_mute_messages = getattr(frappe.flags, "mute_messages", False)
     frappe.flags.mute_messages = True
     try:
-        attendance.insert()
+        attendance.insert(ignore_permissions=True)
     finally:
         frappe.flags.mute_messages = prev_mute_messages
     # Always submit to trigger on_submit hook which creates OLE

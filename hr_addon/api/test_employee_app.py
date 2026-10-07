@@ -13,6 +13,7 @@ from hr_addon.api.employee_app import (
 	_validated_log,
 	describe_empty_day,
 	preview_actual_hours,
+	save_my_checkin,
 	schedule_kind,
 	suggest_missing_punch,
 	summarize_hours,
@@ -373,3 +374,22 @@ class TestPreviewActualHours(FrappeTestCase):
 
 		self.assertTrue(open_shift)
 		self.assertAlmostEqual(actual, 8.0)
+
+
+class TestSaveMyCheckinPermissions(FrappeTestCase):
+	def tearDown(self):
+		frappe.set_user("Administrator")
+
+	@patch("hr_addon.events.employee_checkin.sync_workday")
+	@patch("hr_addon.api.employee_app._current_employee", return_value="HR-EMP-00002")
+	def test_user_without_hr_rights_keeps_the_checkout_time(self, _employee, _sync):
+		frappe.set_user("max@movaria.de")
+		result = save_my_checkin("OUT", "2026-10-02 16:45:00")
+		self.assertEqual(result["log_type"], "OUT")
+		self.assertTrue(str(result["time"]).startswith("2026-10-02 16:45:00"))
+		stored = frappe.db.get_value(
+			"Employee Checkin", result["name"], ["employee", "log_type", "time"], as_dict=True
+		)
+		self.assertEqual(stored.employee, "HR-EMP-00002")
+		self.assertEqual(stored.log_type, "OUT")
+		self.assertTrue(str(stored.time).startswith("2026-10-02 16:45:00"))
