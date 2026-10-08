@@ -144,7 +144,7 @@ class Workday(Document):
 		if not self.status:
 			if self.employee_checkins:
 				self.status = "Present"
-			elif date_is_in_holiday_list(self.employee, self.log_date):
+			elif is_non_working_day_for_employee(self.employee, self.log_date):
 				self.status = "Not Workday"
 			else:
 				leave_application = frappe.db.exists(
@@ -176,11 +176,11 @@ class Workday(Document):
 		):
 			return False
 		leave_application = self._get_submitted_leave_application_name()
-		leave_type = (
-			frappe.db.get_value("Leave Application", leave_application, "leave_type")
-			if leave_application
-			else None
-		)
+		if not leave_application:
+			# Without an approved leave there is nothing to revert: a Half Day coming from
+			# Attendance thresholds must keep its checkin hours.
+			return False
+		leave_type = frappe.db.get_value("Leave Application", leave_application, "leave_type")
 		return is_non_working_day_for_employee(self.employee, self.log_date, leave_type=leave_type)
 
 	def _apply_holiday_not_workday_fields(self):
@@ -362,6 +362,14 @@ def _cap_date_range_by_employee_dates(joining_date, relieving_date, from_day, to
 	return start_day, end_day
 
 
+def has_weekly_working_hours_for_date(employee, date):
+	"""True when submitted Weekly Working Hours hold an hours row for that weekday."""
+	return (
+		get_employee_default_work_hour(employee, date, skip_workday_if_no_weekly_hours=1)
+		is not None
+	)
+
+
 @frappe.whitelist()
 def get_unmarked_range(employee, from_day, to_day):
 	import json
@@ -378,14 +386,6 @@ def get_unmarked_range(employee, from_day, to_day):
 	# If only one employee, use the old logic for backward compatibility
 	if len(employee_list) == 1:
 		single_employee = employee_list[0]
-		# weekly hours check
-		work_hours = get_employee_default_work_hour(
-			single_employee,
-			from_day,
-			skip_workday_if_no_weekly_hours=1
-			)
-		if work_hours is None:
-			return []
 		joining_date, relieving_date = frappe.get_cached_value("Employee", single_employee, ["date_of_joining", "relieving_date"])
 		
 		start_day, end_day = _cap_date_range_by_employee_dates(joining_date, relieving_date, from_day, to_day)
@@ -404,6 +404,10 @@ def get_unmarked_range(employee, from_day, to_day):
 		unmarked_days = []
 
 		for date in days_of_list:
+			# Weekly hours are checked per date: a weekday without an hours row must not
+			# discard the whole range for this employee.
+			if not has_weekly_working_hours_for_date(single_employee, date):
+				continue
 			date_time = get_datetime(date)
 			if date_time not in marked_days:
 				unmarked_days.append(date)
@@ -416,14 +420,6 @@ def get_unmarked_range(employee, from_day, to_day):
 	for emp in employee_list:
 		joining_date, relieving_date = frappe.get_cached_value("Employee", emp, ["date_of_joining", "relieving_date"])
 
-		work_hours = get_employee_default_work_hour(
-			emp,
-			from_day,
-			skip_workday_if_no_weekly_hours=1
-		)
-		if work_hours is None:
-			continue
-		
 		start_day, end_day = _cap_date_range_by_employee_dates(joining_date, relieving_date, from_day, to_day)
 
 		delta = date_diff(end_day, start_day)	
@@ -439,6 +435,8 @@ def get_unmarked_range(employee, from_day, to_day):
 		marked_days = [get_datetime(rcord.log_date) for rcord in rcords]
 
 		for date in days_of_list:
+			if not has_weekly_working_hours_for_date(emp, date):
+				continue
 			date_time = get_datetime(date)
 			if date_time not in marked_days:
 				all_unmarked_days.add(date)
@@ -938,7 +936,12 @@ def get_workday(employee_checkins, employee_default_work_hour, no_break_hours):
     )
     
     attendance = employee_checkins[0].attendance if len(employee_checkins) > 0 else ""
-    status = frappe.db.get_value("Attendance", attendance, "status") if attendance else ""
+    # Only a submitted Attendance may dictate the status; cancelled ones are stale.
+    status = (
+        frappe.db.get_value("Attendance", {"name": attendance, "docstatus": 1}, "status")
+        if attendance
+        else ""
+    )
     if not status:
         status = "Present"
 
@@ -1127,10 +1130,10 @@ def generate_workdays_for_past_7_days_now():
 		employees = frappe.db.get_list("Employee", filters={"status": "Active"})
 		
 		total_employees = 0
-		total_workdays_created = 0
-		total_workdays_failed = 0
+		employees_failed = 0
 		total_dates = 0
 		errors = []
+		queued_jobs = []
 		
 		for employee in employees:
 			try:
@@ -1209,19 +1212,17 @@ def generate_workdays_for_past_7_days_now():
 					"workdays_failed": 0
 				})
 
-				data = {
+				# Jobs are dispatched after the log has been saved so that their result
+				# counts cannot be overwritten by this function.
+				queued_jobs.append({
 					"employee": employee_name,
 					"unmarked_days": valid_unmarked_days,
 					"log_name": log_doc.name,  # Pass log name to background job
 					"skip_workday_if_no_weekly_hours": skip_if_no_weekly_hours
-				}
-				flag = "Create workday"
-
-				bulk_process_workdays_background(data, flag)
-				total_workdays_created += len(valid_unmarked_days)
+				})
 				
 			except Exception as e:
-				total_workdays_failed += 1
+				employees_failed += 1
 				error_msg = "Creating Workday, Got Error: {} while fetching unmarked days for: {}".format(str(e), employee_name)
 				errors.append(error_msg)
 				frappe.log_error(error_msg, "Error during fetching unmarked days")
@@ -1239,16 +1240,24 @@ def generate_workdays_for_past_7_days_now():
 		
 		log_doc.total_employees = total_employees
 		log_doc.total_dates_processed = total_dates
-		log_doc.workdays_created = total_workdays_created
-		log_doc.workdays_failed = total_workdays_failed
+		log_doc.workdays_failed = employees_failed
 		log_doc.duration = duration
-		log_doc.status = "Failed" if total_workdays_failed == total_employees else ("Partially Failed" if total_workdays_failed > 0 else "Completed")
+		# Workdays are created by the background jobs below, which report their own counts.
+		if not employees_failed:
+			log_doc.status = "Completed"
+		elif not total_employees:
+			log_doc.status = "Failed"
+		else:
+			log_doc.status = "Partially Failed"
 		
 		if errors:
 			log_doc.error_log = "\n\n".join(errors)
 		
 		log_doc.save(ignore_permissions=True)
 		frappe.db.commit()
+		
+		for data in queued_jobs:
+			bulk_process_workdays_background(data, "Create workday")
 		
 		frappe.logger().info(f"Workday generation completed. Log: {log_doc.name}, Duration: {duration:.2f}s")
 		
@@ -1297,6 +1306,34 @@ def has_valid_weekly_working_hours(employee, date):
 	)
 
 	return True if daily_hours else False 			
+
+
+def update_generation_log_counts(log_name, created, failed):
+	"""Report the real per-date result of a background job back to its Workday Generation Log."""
+	if not log_name or not (created or failed):
+		return
+
+	if not frappe.db.exists("Workday Generation Log", log_name):
+		return
+
+	GenerationLog = DocType("Workday Generation Log")
+	(
+		frappe.qb.update(GenerationLog)
+		.set(GenerationLog.workdays_created, GenerationLog.workdays_created + created)
+		.set(GenerationLog.workdays_failed, GenerationLog.workdays_failed + failed)
+		.where(GenerationLog.name == log_name)
+	).run()
+
+	if failed and frappe.db.get_value("Workday Generation Log", log_name, "status") == "Completed":
+		frappe.db.set_value(
+			"Workday Generation Log",
+			log_name,
+			"status",
+			"Partially Failed",
+			update_modified=False,
+		)
+
+	frappe.db.commit()
 
 
 def bulk_process_workdays_background(data,flag):
@@ -1354,6 +1391,8 @@ def bulk_process_workdays(data,flag):
 	skipped_by_employee = {}
 	created_by_employee = {}
 	existing_workdays = {}
+	created_count = 0
+	failed_count = 0
 
 	# Process workdays for each employee
 	for emp in employee_list:
@@ -1458,6 +1497,7 @@ def bulk_process_workdays(data,flag):
 					workday.log_date = get_datetime(date)
 					if flag == "Create workday":
 						workday.save()
+						created_count += 1
 						creation_log.workday = workday.name
 						if emp not in created_by_employee:
 							emp_name = frappe.get_value('Employee', emp, 'employee_name') 
@@ -1489,6 +1529,10 @@ def bulk_process_workdays(data,flag):
 
 			except Exception as e:
 				error_trace = traceback.format_exc()
+				failed_count += 1
+				# The failed date left the transaction dirty; roll back so the error can be
+				# logged and the remaining dates keep processing.
+				frappe.db.rollback()
 				message = _("Something went wrong in Workday Creation: {0}".format(str(e)))
 				frappe.log_error(message, "Error in bulk_process_workdays")
 				
@@ -1511,6 +1555,8 @@ def bulk_process_workdays(data,flag):
 						"traceback": error_trace
 					}).insert(ignore_permissions=True)
 					frappe.db.commit()
+
+	update_generation_log_counts(data.get("log_name"), created_count, failed_count)
 
 	formatted_missing_dates = []
 	for missing_date in sorted(all_missing_dates):
@@ -1707,10 +1753,13 @@ def _create_new_attendance(doc, hour_variance, att_status, target_for_att, actua
         row["leave_application"] = leave_info.name
         row["leave_type"] = leave_info.leave_type
     attendance = frappe.get_doc(row)
+    # The punch is saved by the employee. Attendance is a side effect of the
+    # workday, so it must not depend on that user being allowed to create one.
+    attendance.flags.ignore_permissions = True
     prev_mute_messages = getattr(frappe.flags, "mute_messages", False)
     frappe.flags.mute_messages = True
     try:
-        attendance.insert()
+        attendance.insert(ignore_permissions=True)
     finally:
         frappe.flags.mute_messages = prev_mute_messages
     # Always submit to trigger on_submit hook which creates OLE
