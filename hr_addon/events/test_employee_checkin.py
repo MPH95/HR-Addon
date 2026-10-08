@@ -146,6 +146,57 @@ class TestSyncWorkday(FrappeTestCase):
 		mock_log_error.assert_called_once()
 		self.assertFalse(getattr(frappe.flags, SYNC_FLAG, False))
 
+	# A commit inside attendance / the overtime ledger drops the savepoint.
+	# Releasing it must not turn a successful checkout into an error.
+	@patch("hr_addon.events.employee_checkin.frappe.db.commit")
+	@patch(
+		"hr_addon.events.employee_checkin.frappe.db.release_savepoint",
+		side_effect=Exception("(1305, 'SAVEPOINT workday_checkin_sync does not exist')"),
+	)
+	@patch("hr_addon.events.employee_checkin.frappe.get_doc")
+	@patch(
+		"hr_addon.events.employee_checkin.frappe.db.get_value",
+		return_value="WD-2026-00001",
+	)
+	@patch(
+		"hr_addon.hr_addon.doctype.workday.workday.has_weekly_working_hours_for_date",
+		return_value=True,
+	)
+	@patch("hr_addon.events.employee_checkin.frappe.db.exists", return_value="HR-EMP-00001")
+	def test_sync_ignores_a_savepoint_already_released_by_commit(
+		self, _mock_exists, _mock_weekly, _mock_get_value, mock_get_doc, _mock_release, _mock_commit
+	):
+		mock_get_doc.return_value = MagicMock()
+		sync_workday("HR-EMP-00001", "2026-07-25")
+		_mock_commit.assert_called_once()
+
+	# Desk notes printed while the workday is rebuilt must not stay on the request.
+	@patch("hr_addon.events.employee_checkin.frappe.db.commit")
+	@patch("hr_addon.events.employee_checkin.frappe.get_doc")
+	@patch(
+		"hr_addon.events.employee_checkin.frappe.db.get_value",
+		return_value="WD-2026-00001",
+	)
+	@patch(
+		"hr_addon.hr_addon.doctype.workday.workday.has_weekly_working_hours_for_date",
+		return_value=True,
+	)
+	@patch("hr_addon.events.employee_checkin.frappe.db.exists", return_value="HR-EMP-00001")
+	def test_sync_drops_desk_notes(
+		self, _mock_exists, _mock_weekly, _mock_get_value, mock_get_doc, _mock_commit
+	):
+		def save_and_note():
+			frappe.flags.mute_messages = False
+			frappe.msgprint(
+				"No hour variance to record. Actual hours (8.0) equals target hours (8.0)"
+			)
+
+		workday = MagicMock()
+		workday.save.side_effect = save_and_note
+		mock_get_doc.return_value = workday
+		sync_workday("HR-EMP-00001", "2026-07-25")
+		self.assertEqual(frappe.get_message_log(), [])
+
 
 class TestAttendanceIgnoresEmployeePermissions(FrappeTestCase):
 	@patch("hr_addon.hr_addon.doctype.workday.workday.frappe.msgprint")

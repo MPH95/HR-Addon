@@ -1185,6 +1185,10 @@ def save_my_checkin(log_type, time, name=None, latitude=None, longitude=None):
 	if previous_date and previous_date != getdate(timestamp):
 		sync_workday(employee, previous_date)
 
+	# Attendance and the overtime ledger print desk notes ("no hour variance",
+	# "attendance updated"). They are not failures, and the phone must not show them.
+	frappe.clear_messages()
+
 	return {
 		"name": doc.name,
 		"log_type": doc.log_type,
@@ -1221,4 +1225,5 @@ def delete_my_checkin(name):
 	finally:
 		setattr(frappe.flags, SYNC_FLAG, False)
 
+	frappe.clear_messages()
 	return {"deleted": name}

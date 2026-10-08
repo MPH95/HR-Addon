@@ -64,9 +64,14 @@ def sync_workday(employee, log_date):
 		return
 
 	setattr(frappe.flags, SYNC_FLAG, True)
+	# Desk alerts ("Attendance updated", "Overtime Ledger Entry created") are for
+	# the HR form. During an employee check-in they would be returned with the
+	# request and the app would show them as errors.
+	previous_mute = frappe.flags.mute_messages
+	frappe.flags.mute_messages = True
 	# A failed workday update must not undo the check-in the employee just saved.
-	# Rolling back the whole request did that, so the punch vanished and the app
-	# looked like the button had done nothing.
+	# Attendance and the overtime ledger commit inside the save, which drops this
+	# savepoint. Releasing or rolling it back afterwards must not become the error.
 	save_point = "workday_checkin_sync"
 	frappe.db.savepoint(save_point)
 	try:
@@ -80,16 +85,37 @@ def sync_workday(employee, log_date):
 
 		workday.flags.ignore_permissions = True
 		workday.save()
-		frappe.db.release_savepoint(save_point)
-		frappe.db.commit()
 	except Exception:
-		frappe.db.rollback(save_point=save_point)
+		_end_sync_savepoint(save_point, rollback=True)
 		frappe.log_error(
 			title="HR Addon: Workday sync from Employee Checkin",
 			message=f"Employee {employee}, date {log_date}\n\n{frappe.get_traceback()}",
 		)
+	else:
+		_end_sync_savepoint(save_point, rollback=False)
+		frappe.db.commit()
 	finally:
+		frappe.flags.mute_messages = previous_mute
 		setattr(frappe.flags, SYNC_FLAG, False)
+		# Drop desk notes such as "No hour variance to record" so the app does not
+		# show them as an error and skip refreshing the day.
+		frappe.clear_messages()
+
+
+def _end_sync_savepoint(save_point, rollback):
+	"""Release or roll back the sync savepoint.
+
+	A commit inside the workday save already removed it. That is not a failure:
+	the check-in and the ledger row are stored.
+	"""
+	try:
+		if rollback:
+			frappe.db.rollback(save_point=save_point)
+		else:
+			frappe.db.release_savepoint(save_point)
+	except Exception as exc:
+		if "SAVEPOINT" not in str(exc) or "does not exist" not in str(exc):
+			raise
 
 
 def has_checkins(employee, log_date):
